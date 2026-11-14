@@ -196,11 +196,18 @@ def source():
 
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "normal"
-    if mode in ("normal", "demo"):
+    if mode == "normal":
         print(json.dumps(normal(), ensure_ascii=False, sort_keys=True))
     elif mode == "source":
         print(json.dumps(source(), sort_keys=True))
-    elif mode == "verify":
+    elif mode in ("verify", "demo"):
+        # Released-artifact acceptance: install from a reproducible ZIP,
+        # collect through the installed user service, and account the result.
+        import lab
+        value = lab.verify(sys.argv[2] if len(sys.argv) > 2 else None) if mode == "verify" \
+            else lab.demo(sys.argv[2] if len(sys.argv) > 2 else None)
+        print(json.dumps(value, ensure_ascii=False, sort_keys=True))
+    elif mode == "business":
         print(json.dumps({"business": normal(), "source": source()}, sort_keys=True))
     elif mode == "fixture":
         Path(sys.argv[2]).write_bytes(pipeline.encode(large()))
@@ -208,7 +215,8 @@ def main():
         print(json.dumps(installed(sys.argv[2], json.loads(Path(sys.argv[3]).read_bytes())),
                          sort_keys=True))
     else:
-        raise SystemExit("usage: checks.py normal|demo|source|verify|fixture PATH|installed ROOT INPUT")
+        raise SystemExit("usage: checks.py normal|demo [DIR]|source|verify [DIR]|"
+                         "business|fixture PATH|installed ROOT INPUT")
 
 
 if __name__ == "__main__":

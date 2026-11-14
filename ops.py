@@ -1,4 +1,4 @@
-"""Working packaging and user-service scaffold; no recovery policy."""
+"""Reproducible packaging and the RestartingAgent user-service scaffold."""
 import argparse
 import hashlib
 import io
@@ -6,8 +6,10 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import shutil
 import subprocess
 import sys
+import time
 import zipfile
 
 import runtime
@@ -29,11 +31,13 @@ def archive(items):
 
 def build(destination):
     source = Path(__file__).resolve().parent
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
     app = archive({**{name: (source / name).read_bytes() for name in CODE},
                    "__main__.py": MAIN.encode()})
     manifest = {"format": 1, "sha256": hashlib.sha256(app).hexdigest()}
-    Path(destination).write_bytes(archive({"app.pyz": app,
-                                           "manifest.json": runtime.encode(manifest)}))
+    destination.write_bytes(archive({"app.pyz": app,
+                                     "manifest.json": runtime.encode(manifest)}))
     return manifest
 
 
@@ -70,6 +74,7 @@ def install(release, root, control):
 def start(root):
     root = Path(root).resolve()
     control = Path(json.loads((root / "config.json").read_bytes())["control"])
+    control.mkdir(parents=True, exist_ok=True)
     config = {
         "Label": identity(root),
         "ProgramArguments": [str(Path(sys.executable).resolve()), str(root / "app.pyz"),
@@ -84,18 +89,118 @@ def start(root):
     path = agent_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(plistlib.dumps(config))
-    domain = "gui/" + str(os.getuid())
-    registered = subprocess.run(["launchctl", "print", domain + "/" + identity(root)],
-                                capture_output=True).returncode == 0
-    if not registered:
-        subprocess.run(["launchctl", "bootstrap", domain, str(path)], check=True)
-    subprocess.run(["launchctl", "kickstart", domain + "/" + identity(root)], check=True)
+    if shutil.which("launchctl"):
+        domain = "gui/" + str(os.getuid())
+        registered = subprocess.run(["launchctl", "print", domain + "/" + identity(root)],
+                                    capture_output=True).returncode == 0
+        if not registered:
+            subprocess.run(["launchctl", "bootstrap", domain, str(path)], check=True)
+        subprocess.run(["launchctl", "kickstart", domain + "/" + identity(root)], check=True)
+    else:
+        # Non-macOS development hosts still get a supervised process with the
+        # same restart contract, using the installed personal-agent plist.
+        _spawn_fallback(root, control)
     return {"label": identity(root), "plist": str(path)}
 
 
+def _fallback_state(root):
+    root = Path(root).resolve()
+    control = Path(json.loads((root / "config.json").read_bytes())["control"])
+    return control / "fallback-agent.json"
+
+
+_SUPERVISOR = """
+import json, os, subprocess, sys, time
+app, root, state = sys.argv[1:4]
+executable = sys.executable
+pidfile = state + ".tmp"
+while True:
+    child = subprocess.Popen([executable, app, "worker", root], cwd=root,
+                             stdin=subprocess.DEVNULL, stdout=sys.stderr, stderr=sys.stderr)
+    with open(pidfile, "w") as target:
+        json.dump({"pid": child.pid, "supervisor": os.getpid()}, target)
+    os.replace(pidfile, state)
+    child.wait()
+    time.sleep(2)
+"""
+
+
+def _spawn_fallback(root, control):
+    control.mkdir(parents=True, exist_ok=True)
+    state = _fallback_state(root)
+    if state.exists():
+        try:
+            record = json.loads(state.read_text())
+        except ValueError:
+            record = {}
+        if all(isinstance(record.get(key), int) and _alive(record[key])
+               for key in ("pid", "supervisor")):
+            return
+        state.unlink(missing_ok=True)
+    logs = [open(control / "service.stdout", "ab"), open(control / "service.stderr", "ab")]
+    process = subprocess.Popen(
+        [str(Path(sys.executable).resolve()), "-c", _SUPERVISOR,
+         str(Path(root) / "app.pyz"), str(root), str(state)],
+        cwd=str(root), stdin=subprocess.DEVNULL, stdout=logs[0], stderr=logs[1],
+        start_new_session=True)
+    for _ in range(100):
+        if state.exists():
+            return
+        time.sleep(0.05)
+    raise RuntimeError("AGENT_NOT_READY")
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _stop_fallback(root):
+    state = _fallback_state(root)
+    if not state.exists():
+        return
+    try:
+        record = json.loads(state.read_text())
+    except ValueError:
+        record = {}
+    supervisor = record.get("supervisor")
+    child = record.get("pid")
+    if isinstance(supervisor, int):
+        try:
+            os.kill(supervisor, 15)  # Stop respawning before the child.
+        except ProcessLookupError:
+            pass
+    if isinstance(child, int):
+        try:
+            os.kill(child, 15)
+        except ProcessLookupError:
+            pass
+    for pid in (supervisor, child):
+        if not isinstance(pid, int):
+            continue
+        for _ in range(50):
+            if not _alive(pid):
+                break
+            time.sleep(0.1)
+        else:
+            try:
+                os.kill(pid, 9)
+            except ProcessLookupError:
+                pass
+    state.unlink(missing_ok=True)
+
+
 def stop(root):
-    target = "gui/" + str(os.getuid()) + "/" + identity(root)
-    subprocess.run(["launchctl", "bootout", target], capture_output=True)
+    if shutil.which("launchctl"):
+        target = "gui/" + str(os.getuid()) + "/" + identity(root)
+        subprocess.run(["launchctl", "bootout", target], capture_output=True)
+    else:
+        _stop_fallback(root)
     agent_path(root).unlink(missing_ok=True)
     return {"stopped": identity(root)}
 
@@ -146,7 +251,9 @@ def main(argv=None):
     elif args.operation == "read":
         value = runtime.read(args.root, args.batch_id)
     elif args.operation == "run":
-        value = {"processed": collector.run_one(args.root) or runtime.run_one(args.root)}
+        processed = collector.run_one(args.root)
+        processed = runtime.run_one(args.root) or processed
+        value = {"processed": processed}
     elif args.operation == "worker":
         collector.worker(args.root)
         return

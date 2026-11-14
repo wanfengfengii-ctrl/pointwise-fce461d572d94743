@@ -1,7 +1,15 @@
 {
   "version": 1,
   "kind": "cli",
-  "setup": [],
+  "setup": [
+    [
+      "python3",
+      "-B",
+      "ops.py",
+      "build",
+      "dist/pointwise-release.zip"
+    ]
+  ],
   "verify": [
     "python3",
     "-B",
@@ -12,6 +20,6 @@
     "python3",
     "-B",
     "checks.py",
-    "source"
+    "demo"
   ]
 }
